@@ -1,33 +1,29 @@
 import graphene
 
 from ...page import models
-from ..utils import filter_by_query_param
-from .types import Page
-
-PAGE_SEARCH_FIELDS = ('content', 'slug', 'title')
+from .types import PageType
 
 
-def resolve_page(info, id=None, slug=None):
-    assert id or slug, 'No page ID or slug provided.'
+def resolve_page(info, global_page_id=None, slug=None):
+    assert global_page_id or slug, "No page ID or slug provided."
     user = info.context.user
 
     if slug is not None:
-        try:
-            page = models.Page.objects.visible_to_user(user).get(slug=slug)
-        except models.Page.DoesNotExist:
-            page = None
+        page = models.Page.objects.visible_to_user(user).filter(slug=slug).first()
     else:
-        page = graphene.Node.get_node_from_global_id(info, id, Page)
-        # Resolve to null if page is not published and user has no permission
-        # to manage pages.
-        is_available_to_user = (
-            page.is_published or user.has_perm('page.manage_pages'))
-        if page and not is_available_to_user:
-            page = None
+        _type, page_pk = graphene.Node.from_global_id(global_page_id)
+        page = models.Page.objects.visible_to_user(user).filter(pk=page_pk).first()
     return page
 
 
-def resolve_pages(info, query):
+def resolve_pages(info, **_kwargs):
     user = info.context.user
-    qs = models.Page.objects.visible_to_user(user)
-    return filter_by_query_param(qs, query, PAGE_SEARCH_FIELDS)
+    return models.Page.objects.visible_to_user(user)
+
+
+def resolve_page_type(info, global_page_type_id):
+    return graphene.Node.get_node_from_global_id(info, global_page_type_id, PageType)
+
+
+def resolve_page_types(info, **_kwargs):
+    return models.PageType.objects.all()

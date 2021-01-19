@@ -1,915 +1,733 @@
-"""Cart-related utility functions."""
-from datetime import date, timedelta
-from functools import wraps
-from uuid import UUID
+"""Checkout-related utility functions."""
+from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
 
-from django.conf import settings
-from django.contrib import messages
-from django.db import transaction
-from django.db.models import Sum
-from django.utils.encoding import smart_text
-from django.utils.translation import get_language, pgettext, pgettext_lazy
-from prices import TaxedMoneyRange
+from django.core.exceptions import ValidationError
+from django.db.models import Max, Min, Sum
+from django.utils import timezone
+from prices import Money, MoneyRange, TaxedMoneyRange
 
-from . import AddressType, logger
-from ..account.forms import get_address_form
-from ..account.models import Address, User
-from ..account.utils import store_user_address
-from ..core.exceptions import InsufficientStock
-from ..core.utils import to_local_currency
-from ..core.utils.taxes import ZERO_MONEY, get_taxes_for_country
-from ..discount import VoucherType
+from ..account.models import User
+from ..channel.models import Channel
+from ..checkout import calculations
+from ..checkout.error_codes import CheckoutErrorCode
+from ..core.exceptions import ProductNotPublished
+from ..core.taxes import zero_taxed_money
+from ..core.utils.promo_code import (
+    InvalidPromoCode,
+    promo_code_is_gift_card,
+    promo_code_is_voucher,
+)
+from ..discount import DiscountInfo, VoucherType
 from ..discount.models import NotApplicable, Voucher
 from ..discount.utils import (
-    get_products_voucher_discount, get_shipping_voucher_discount,
-    get_value_voucher_discount, increase_voucher_usage)
-from ..order.models import Order
+    get_products_voucher_discount,
+    validate_voucher_for_checkout,
+)
+from ..giftcard.utils import (
+    add_gift_card_code_to_checkout,
+    remove_gift_card_code_from_checkout,
+)
+from ..plugins.manager import PluginsManager, get_plugins_manager
+from ..product import models as product_models
 from ..shipping.models import ShippingMethod
-from .forms import (
-    AddressChoiceForm, AnonymousUserBillingForm, AnonymousUserShippingForm,
-    BillingAddressChoiceForm)
-from .models import Cart
+from ..warehouse.availability import check_stock_quantity, check_stock_quantity_bulk
+from . import AddressType, CheckoutLineInfo
+from .models import Checkout, CheckoutLine
 
-COOKIE_NAME = 'cart'
+if TYPE_CHECKING:
+    # flake8: noqa
+    from prices import TaxedMoney
 
-
-def set_cart_cookie(simple_cart, response):
-    """Update response with a cart token cookie."""
-    # FIXME: document why session is not used
-    max_age = int(timedelta(days=30).total_seconds())
-    response.set_signed_cookie(COOKIE_NAME, simple_cart.token, max_age=max_age)
+    from ..account.models import Address
 
 
-def contains_unavailable_variants(cart):
-    """Return `True` if cart contains any unfulfillable lines."""
-    try:
-        for line in cart:
-            line.variant.check_quantity(line.quantity)
-    except InsufficientStock:
-        return True
-    return False
+def get_user_checkout(
+    user: User, checkout_queryset=Checkout.objects.all()
+) -> Tuple[Optional[Checkout], bool]:
+    return checkout_queryset.filter(user=user, channel__is_active=True).first()
 
 
-def token_is_valid(token):
-    """Validate a cart token."""
-    if token is None:
-        return False
-    if isinstance(token, UUID):
-        return True
-    try:
-        UUID(token)
-    except ValueError:
-        return False
-    return True
+def check_variant_in_stock(
+    checkout, variant, quantity=1, replace=False, check_quantity=True
+) -> Tuple[int, Optional[CheckoutLine]]:
+    """Check if a given variant is in stock and return the new quantity + line."""
+    line = checkout.lines.filter(variant=variant).first()
+    line_quantity = 0 if line is None else line.quantity
+
+    new_quantity = quantity if replace else (quantity + line_quantity)
+
+    if new_quantity < 0:
+        raise ValueError(
+            "%r is not a valid quantity (results in %r)" % (quantity, new_quantity)
+        )
+
+    if new_quantity > 0 and check_quantity:
+        check_stock_quantity(variant, checkout.get_country(), new_quantity)
+
+    return new_quantity, line
 
 
-def remove_unavailable_variants(cart):
-    """Remove any unavailable items from cart."""
-    for line in cart:
-        try:
-            add_variant_to_cart(
-                cart, line.variant, line.quantity, replace=True)
-        except InsufficientStock as e:
-            quantity = e.item.quantity_available
-            add_variant_to_cart(cart, line.variant, quantity, replace=True)
-
-
-def get_variant_prices_from_lines(lines):
-    """Get's price of each individual item within the lines."""
-    return [
-        line.variant.get_price()
-        for line in lines
-        for item in range(line.quantity)]
-
-
-def get_prices_of_discounted_products(lines, discounted_products):
-    """Get prices of variants belonging to the discounted products."""
-    # If there's no discounted_products,
-    # it means that all products are discounted
-    if discounted_products:
-        lines = (
-            line for line in lines
-            if line.variant.product in discounted_products)
-    return get_variant_prices_from_lines(lines)
-
-
-def get_prices_of_products_in_discounted_collections(
-        lines, discounted_collections):
-    """Get prices of variants belonging to the discounted collections."""
-    # If there's no discounted collections,
-    # it means that all of them are discounted
-    if discounted_collections:
-        discounted_collections = set(discounted_collections)
-        lines = (
-            line for line in lines
-            if line.variant and
-            set(line.variant.product.collections.all()).intersection(
-                discounted_collections))
-    return get_variant_prices_from_lines(lines)
-
-
-def get_prices_of_products_in_discounted_categories(
-        lines, discounted_categories):
-    """Get prices of variants belonging to the discounted categories.
-
-    Product must be assigned directly to the discounted category, assigning
-    product to child category won't work.
-    """
-    # If there's no discounted collections,
-    # it means that all of them are discounted
-    if discounted_categories:
-        discounted_categories = set(discounted_categories)
-        lines = (
-            line for line in lines
-            if line.variant and
-            line.variant.product.category in discounted_categories)
-    return get_variant_prices_from_lines(lines)
-
-
-def check_product_availability_and_warn(request, cart):
-    """Warn if cart contains any lines that cannot be fulfilled."""
-    if contains_unavailable_variants(cart):
-        msg = pgettext_lazy(
-            'Cart warning message',
-            'Sorry. We don\'t have that many items in stock. '
-            'Quantity was set to maximum available for now.')
-        messages.warning(request, msg)
-        remove_unavailable_variants(cart)
-
-
-def find_and_assign_anonymous_cart(queryset=Cart.objects.all()):
-    """Assign cart from cookie to request user."""
-    def get_cart(view):
-        @wraps(view)
-        def func(request, *args, **kwargs):
-            response = view(request, *args, **kwargs)
-            token = request.get_signed_cookie(COOKIE_NAME, default=None)
-            if not token_is_valid(token):
-                return response
-            cart = get_anonymous_cart_from_token(
-                token=token, cart_queryset=queryset)
-            if cart is None:
-                return response
-            if request.user.is_authenticated:
-                with transaction.atomic():
-                    change_cart_user(cart, request.user)
-                    carts_to_close = Cart.objects.filter(user=request.user)
-                    carts_to_close = carts_to_close.exclude(token=token)
-                    carts_to_close.delete()
-                response.delete_cookie(COOKIE_NAME)
-            return response
-
-        return func
-    return get_cart
-
-
-def get_or_create_anonymous_cart_from_token(
-        token, cart_queryset=Cart.objects.all()):
-    """Return an open unassigned cart with given token or create a new one."""
-    return cart_queryset.filter(token=token, user=None).get_or_create(
-        defaults={'user': None})[0]
-
-
-def get_or_create_user_cart(user: User, cart_queryset=Cart.objects.all()):
-    """Return an open cart for given user or create a new one."""
-    defaults = {
-        'shipping_address': user.default_shipping_address,
-        'billing_address': user.default_billing_address}
-
-    cart = cart_queryset.filter(user=user).first()
-    if cart is None:
-        cart = Cart.objects.create(user=user, **defaults)
-    return cart
-
-
-def get_anonymous_cart_from_token(token, cart_queryset=Cart.objects.all()):
-    """Return an open unassigned cart with given token if any."""
-    return cart_queryset.filter(token=token, user=None).first()
-
-
-def get_user_cart(user, cart_queryset=Cart.objects.all()):
-    """Return an open cart for given user if any."""
-    return cart_queryset.filter(user=user).first()
-
-
-def get_or_create_cart_from_request(request, cart_queryset=Cart.objects.all()):
-    """Fetch cart from database or create a new one based on cookie."""
-    if request.user.is_authenticated:
-        return get_or_create_user_cart(request.user, cart_queryset)
-    token = request.get_signed_cookie(COOKIE_NAME, default=None)
-    return get_or_create_anonymous_cart_from_token(token, cart_queryset)
-
-
-def get_cart_from_request(request, cart_queryset=Cart.objects.all()):
-    """Fetch cart from database or return a new instance based on cookie."""
-    if request.user.is_authenticated:
-        cart = get_user_cart(request.user, cart_queryset)
-        user = request.user
-    else:
-        token = request.get_signed_cookie(COOKIE_NAME, default=None)
-        cart = get_anonymous_cart_from_token(token, cart_queryset)
-        user = None
-    if cart is not None:
-        return cart
-    if user:
-        return Cart(user=user)
-    return Cart()
-
-
-def get_or_empty_db_cart(cart_queryset=Cart.objects.all()):
-    """Decorate view to receive a cart if one exists.
-
-    Changes the view signature from `func(request, ...)` to
-    `func(request, cart, ...)`.
-
-    If no matching cart is found, an unsaved `Cart` instance will be used.
-    """
-    # FIXME: behave like middleware and assign cart to request instead
-    def get_cart(view):
-        @wraps(view)
-        def func(request, *args, **kwargs):
-            cart = get_cart_from_request(request, cart_queryset)
-            return view(request, cart, *args, **kwargs)
-        return func
-    return get_cart
-
-
-def get_cart_data(cart, shipping_range, currency, discounts, taxes):
-    """Return a JSON-serializable representation of the cart."""
-    cart_total = None
-    local_cart_total = None
-    shipping_required = False
-    total_with_shipping = None
-    local_total_with_shipping = None
-    if cart:
-        cart_total = cart.get_subtotal(discounts, taxes)
-        local_cart_total = to_local_currency(cart_total, currency)
-        shipping_required = cart.is_shipping_required()
-        total_with_shipping = TaxedMoneyRange(
-            start=cart_total, stop=cart_total)
-        if shipping_required and shipping_range:
-            total_with_shipping = shipping_range + cart_total
-        local_total_with_shipping = to_local_currency(
-            total_with_shipping, currency)
-
-    return {
-        'cart_total': cart_total,
-        'local_cart_total': local_cart_total,
-        'shipping_required': shipping_required,
-        'total_with_shipping': total_with_shipping,
-        'local_total_with_shipping': local_total_with_shipping}
-
-
-def find_open_cart_for_user(user):
-    """Find an open cart for the given user."""
-    carts = user.carts.all()
-    open_cart = carts.first()
-    if len(carts) > 1:
-        logger.warning('%s has more than one open basket', user)
-        carts.exclude(token=open_cart.token).delete()
-    return open_cart
-
-
-def change_cart_user(cart, user):
-    """Assign cart to a user.
-
-    If the user already has an open cart assigned, cancel it.
-    """
-    open_cart = find_open_cart_for_user(user)
-    if open_cart is not None:
-        open_cart.delete()
-    cart.user = user
-    cart.shipping_address = user.default_shipping_address
-    cart.billing_address = user.default_billing_address
-    cart.save(update_fields=['user', 'shipping_address', 'billing_address'])
-
-
-def update_cart_quantity(cart):
-    """Update the total quantity in cart."""
-    total_lines = cart.lines.aggregate(
-        total_quantity=Sum('quantity'))['total_quantity']
-    if not total_lines:
-        total_lines = 0
-    cart.quantity = total_lines
-    cart.save(update_fields=['quantity'])
-
-
-def add_variant_to_cart(
-        cart, variant, quantity=1, replace=False, check_quantity=True):
-    """Add a product variant to cart.
-
-    The `data` parameter may be used to differentiate between items with
-    different customization options.
+def add_variant_to_checkout(
+    checkout, variant, quantity=1, replace=False, check_quantity=True
+):
+    """Add a product variant to checkout.
 
     If `replace` is truthy then any previous quantity is discarded instead
     of added to.
     """
-    line, _ = cart.lines.get_or_create(
-        variant=variant, defaults={'quantity': 0, 'data': {}})
-    new_quantity = quantity if replace else (quantity + line.quantity)
+    product_channel_listing = variant.product.channel_listings.filter(
+        channel_id=checkout.channel_id
+    ).first()
+    if not product_channel_listing or not product_channel_listing.is_published:
+        raise ProductNotPublished()
 
-    if new_quantity < 0:
-        raise ValueError('%r is not a valid quantity (results in %r)' % (
-            quantity, new_quantity))
+    new_quantity, line = check_variant_in_stock(
+        checkout,
+        variant,
+        quantity=quantity,
+        replace=replace,
+        check_quantity=check_quantity,
+    )
+
+    if line is None:
+        line = checkout.lines.filter(variant=variant).first()
 
     if new_quantity == 0:
-        line.delete()
-    else:
-        if check_quantity:
-            variant.check_quantity(new_quantity)
-
+        if line is not None:
+            line.delete()
+    elif line is None:
+        checkout.lines.create(checkout=checkout, variant=variant, quantity=new_quantity)
+    elif new_quantity > 0:
         line.quantity = new_quantity
-        line.save(update_fields=['quantity'])
+        line.save(update_fields=["quantity"])
 
-    update_cart_quantity(cart)
-
-
-def get_shipping_address_forms(cart, user_addresses, data, country):
-    """Forms initialized with data depending on shipping address in cart."""
-    shipping_address = (
-        cart.shipping_address or cart.user.default_shipping_address)
-
-    if shipping_address and shipping_address in user_addresses:
-        address_form, preview = get_address_form(
-            data, country_code=country.code,
-            initial={'country': country})
-        addresses_form = AddressChoiceForm(
-            data, addresses=user_addresses,
-            initial={'address': shipping_address.id})
-    elif shipping_address:
-        address_form, preview = get_address_form(
-            data, country_code=shipping_address.country.code,
-            instance=shipping_address)
-        addresses_form = AddressChoiceForm(
-            data, addresses=user_addresses)
-    else:
-        address_form, preview = get_address_form(
-            data, country_code=country.code,
-            initial={'country': country})
-        addresses_form = AddressChoiceForm(
-            data, addresses=user_addresses)
-
-    return address_form, addresses_form, preview
+    checkout = update_checkout_quantity(checkout)
+    return checkout
 
 
-def update_shipping_address_in_cart(cart, user_addresses, data, country):
-    """Return shipping address choice forms and if an address was updated."""
-    address_form, addresses_form, preview = (
-        get_shipping_address_forms(cart, user_addresses, data, country))
+def add_variants_to_checkout(checkout, variants, quantities):
+    """Add variants to checkout.
 
-    updated = False
+    Suitable for new checkouts as it always creates new checkout lines without checking
+    if there are any existing ones already.
+    """
 
-    if addresses_form.is_valid() and not preview:
-        use_existing_address = (
-            addresses_form.cleaned_data['address'] !=
-            AddressChoiceForm.NEW_ADDRESS)
+    # check quantities
+    country_code = checkout.get_country()
+    check_stock_quantity_bulk(variants, country_code, quantities)
 
-        if use_existing_address:
-            address_id = addresses_form.cleaned_data['address']
-            address = Address.objects.get(id=address_id)
-            change_shipping_address_in_cart(cart, address)
-            updated = True
+    channel_listings = product_models.ProductChannelListing.objects.filter(
+        channel_id=checkout.channel.id,
+        product_id__in=[v.product_id for v in variants],
+    )
+    channel_listings_by_product_id = {cl.product_id: cl for cl in channel_listings}
 
-        elif address_form.is_valid():
-            address = address_form.save()
-            change_shipping_address_in_cart(cart, address)
-            updated = True
+    # check if variants are published
+    for variant in variants:
+        product_channel_listing = channel_listings_by_product_id[variant.product_id]
+        if not product_channel_listing or not product_channel_listing.is_published:
+            raise ProductNotPublished()
 
-    return addresses_form, address_form, updated
-
-
-def update_shipping_address_in_anonymous_cart(cart, data, country):
-    """Return shipping address choice forms and if an address was updated."""
-    address_form, preview = get_address_form(
-        data, country_code=country.code,
-        autocomplete_type='shipping',
-        instance=cart.shipping_address,
-        initial={'country': country})
-    user_form = AnonymousUserShippingForm(
-        data if not preview else None, instance=cart)
-
-    updated = False
-
-    if user_form.is_valid() and address_form.is_valid():
-        user_form.save()
-        address = address_form.save()
-        change_shipping_address_in_cart(cart, address)
-        updated = True
-
-    return user_form, address_form, updated
+    # create checkout lines
+    lines = []
+    for variant, quantity in zip(variants, quantities):
+        lines.append(
+            CheckoutLine(checkout=checkout, variant=variant, quantity=quantity)
+        )
+    checkout.lines.bulk_create(lines)
+    checkout = update_checkout_quantity(checkout)
+    return checkout
 
 
-def get_billing_forms_with_shipping(cart, data, user_addresses, country):
-    """Get billing form based on a the current billing and shipping data."""
-    shipping_address = cart.shipping_address
-    billing_address = cart.billing_address or Address(country=country)
-
-    if not billing_address.id or billing_address == shipping_address:
-        address_form, preview = get_address_form(
-            data, country_code=shipping_address.country.code,
-            autocomplete_type='billing',
-            initial={'country': shipping_address.country})
-        addresses_form = BillingAddressChoiceForm(
-            data, addresses=user_addresses, initial={
-                'address': BillingAddressChoiceForm.SHIPPING_ADDRESS})
-    elif billing_address in user_addresses:
-        address_form, preview = get_address_form(
-            data, country_code=billing_address.country.code,
-            autocomplete_type='billing',
-            initial={'country': billing_address.country})
-        addresses_form = BillingAddressChoiceForm(
-            data, addresses=user_addresses, initial={
-                'address': billing_address.id})
-    else:
-        address_form, preview = get_address_form(
-            data, country_code=billing_address.country.code,
-            autocomplete_type='billing',
-            initial={'country': billing_address.country},
-            instance=billing_address)
-        addresses_form = BillingAddressChoiceForm(
-            data, addresses=user_addresses, initial={
-                'address': BillingAddressChoiceForm.NEW_ADDRESS})
-
-    return address_form, addresses_form, preview
+def update_checkout_quantity(checkout):
+    """Update the total quantity in checkout."""
+    total_lines = checkout.lines.aggregate(total_quantity=Sum("quantity"))[
+        "total_quantity"
+    ]
+    if not total_lines:
+        total_lines = 0
+    checkout.quantity = total_lines
+    checkout.save(update_fields=["quantity"])
+    return checkout
 
 
-def update_billing_address_in_cart_with_shipping(
-        cart, user_addresses, data, country):
-    """Return shipping address choice forms and if an address was updated."""
-    address_form, addresses_form, preview = get_billing_forms_with_shipping(
-        cart, data, user_addresses, country)
-
-    updated = False
-
-    if addresses_form.is_valid() and not preview:
-        address = None
-        address_id = addresses_form.cleaned_data['address']
-
-        if address_id == BillingAddressChoiceForm.SHIPPING_ADDRESS:
-            if cart.user and cart.shipping_address in user_addresses:
-                address = cart.shipping_address
-            else:
-                address = cart.shipping_address.get_copy()
-        elif address_id != BillingAddressChoiceForm.NEW_ADDRESS:
-            address = user_addresses.get(id=address_id)
-        elif address_form.is_valid():
-            address = address_form.save()
-
-        if address:
-            change_billing_address_in_cart(cart, address)
-            updated = True
-
-    return addresses_form, address_form, updated
-
-
-def get_anonymous_summary_without_shipping_forms(cart, data, country):
-    """Forms initialized with data depending on addresses in cart."""
-    billing_address = cart.billing_address
-
-    if billing_address:
-        address_form, preview = get_address_form(
-            data, country_code=billing_address.country.code,
-            autocomplete_type='billing', instance=billing_address)
-    else:
-        address_form, preview = get_address_form(
-            data, country_code=country.code,
-            autocomplete_type='billing', initial={'country': country})
-
-    return address_form, preview
-
-
-def update_billing_address_in_anonymous_cart(cart, data, country):
-    """Return shipping address choice forms and if an address was updated."""
-    address_form, preview = get_anonymous_summary_without_shipping_forms(
-        cart, data, country)
-    user_form = AnonymousUserBillingForm(data, instance=cart)
-
-    updated = False
-
-    if user_form.is_valid() and address_form.is_valid() and not preview:
-        user_form.save()
-        address = address_form.save()
-        change_billing_address_in_cart(cart, address)
-        updated = True
-
-    return user_form, address_form, updated
-
-
-def get_summary_without_shipping_forms(cart, user_addresses, data, country):
-    """Forms initialized with data depending on addresses in cart."""
-    billing_address = cart.billing_address
-
-    if billing_address and billing_address in user_addresses:
-        address_form, preview = get_address_form(
-            data,
-            autocomplete_type='billing',
-            country_code=billing_address.country.code,
-            initial={'country': billing_address.country})
-        initial_address = billing_address.id
-    elif billing_address:
-        address_form, preview = get_address_form(
-            data,
-            autocomplete_type='billing',
-            country_code=billing_address.country.code,
-            initial={'country': billing_address.country},
-            instance=billing_address)
-        initial_address = AddressChoiceForm.NEW_ADDRESS
-    else:
-        address_form, preview = get_address_form(
-            data,
-            autocomplete_type='billing',
-            country_code=country.code,
-            initial={'country': country})
-        if cart.user and cart.user.default_billing_address:
-            initial_address = cart.user.default_billing_address.id
-        else:
-            initial_address = AddressChoiceForm.NEW_ADDRESS
-
-    addresses_form = AddressChoiceForm(
-        data, addresses=user_addresses, initial={'address': initial_address})
-    return address_form, addresses_form, preview
-
-
-def update_billing_address_in_cart(cart, user_addresses, data, country):
-    """Return shipping address choice forms and if an address was updated."""
-    address_form, addresses_form, preview = (
-        get_summary_without_shipping_forms(
-            cart, user_addresses, data, country))
-
-    updated = False
-
-    if addresses_form.is_valid():
-        use_existing_address = (
-            addresses_form.cleaned_data['address'] !=
-            AddressChoiceForm.NEW_ADDRESS)
-
-        if use_existing_address:
-            address_id = addresses_form.cleaned_data['address']
-            address = Address.objects.get(id=address_id)
-            change_billing_address_in_cart(cart, address)
-            updated = True
-
-        elif address_form.is_valid():
-            address = address_form.save()
-            change_billing_address_in_cart(cart, address)
-            updated = True
-
-    return addresses_form, address_form, updated
-
-
-def _check_new_cart_address(cart, address, address_type):
-    """Check if and address in cart has changed and if to remove old one."""
+def _check_new_checkout_address(checkout, address, address_type):
+    """Check if and address in checkout has changed and if to remove old one."""
     if address_type == AddressType.BILLING:
-        old_address = cart.billing_address
+        old_address = checkout.billing_address
     else:
-        old_address = cart.shipping_address
+        old_address = checkout.shipping_address
 
-    has_address_changed = any([
-        not address and old_address,
-        address and not old_address,
-        address and old_address and address != old_address])
+    has_address_changed = any(
+        [
+            not address and old_address,
+            address and not old_address,
+            address and old_address and address != old_address,
+        ]
+    )
 
     remove_old_address = (
-        has_address_changed and
-        old_address is not None and
-        (not cart.user or old_address not in cart.user.addresses.all()))
+        has_address_changed
+        and old_address is not None
+        and (not checkout.user or old_address not in checkout.user.addresses.all())
+    )
 
     return has_address_changed, remove_old_address
 
 
-def change_billing_address_in_cart(cart, address):
-    """Save billing address in cart if changed.
+def change_billing_address_in_checkout(checkout, address):
+    """Save billing address in checkout if changed.
 
     Remove previously saved address if not connected to any user.
     """
-    changed, remove = _check_new_cart_address(
-        cart, address, AddressType.BILLING)
+    changed, remove = _check_new_checkout_address(
+        checkout, address, AddressType.BILLING
+    )
     if changed:
         if remove:
-            cart.billing_address.delete()
-        cart.billing_address = address
-        cart.save(update_fields=['billing_address'])
+            checkout.billing_address.delete()
+        checkout.billing_address = address
+        checkout.save(update_fields=["billing_address", "last_change"])
 
 
-def change_shipping_address_in_cart(cart, address):
-    """Save shipping address in cart if changed.
+def change_shipping_address_in_checkout(checkout, address):
+    """Save shipping address in checkout if changed.
 
     Remove previously saved address if not connected to any user.
     """
-    changed, remove = _check_new_cart_address(
-        cart, address, AddressType.SHIPPING)
+    changed, remove = _check_new_checkout_address(
+        checkout, address, AddressType.SHIPPING
+    )
     if changed:
         if remove:
-            cart.shipping_address.delete()
-        cart.shipping_address = address
-        cart.save(update_fields=['shipping_address'])
+            checkout.shipping_address.delete()
+        checkout.shipping_address = address
+        checkout.save(update_fields=["shipping_address", "last_change"])
 
 
-def get_cart_data_for_checkout(cart, discounts, taxes):
-    """Data shared between views in checkout process."""
-    lines = [(line, line.get_total(discounts, taxes)) for line in cart]
-    subtotal = cart.get_subtotal(discounts, taxes)
-    total = cart.get_total(discounts, taxes)
-    shipping_price = cart.get_shipping_price(taxes)
-    return {
-        'cart': cart,
-        'cart_are_taxes_handled': bool(taxes),
-        'cart_lines': lines,
-        'cart_shipping_price': shipping_price,
-        'cart_subtotal': subtotal,
-        'cart_total': total}
-
-
-def _get_shipping_voucher_discount_for_cart(voucher, cart):
+def _get_shipping_voucher_discount_for_checkout(
+    manager: PluginsManager,
+    voucher: Voucher,
+    checkout: Checkout,
+    lines: Iterable[CheckoutLineInfo],
+    address: Optional["Address"],
+    discounts: Optional[Iterable[DiscountInfo]] = None,
+):
     """Calculate discount value for a voucher of shipping type."""
-    if not cart.is_shipping_required():
-        msg = pgettext(
-            'Voucher not applicable',
-            'Your order does not require shipping.')
+    if not is_shipping_required(lines):
+        msg = "Your order does not require shipping."
         raise NotApplicable(msg)
-    shipping_method = cart.shipping_method
+    shipping_method = checkout.shipping_method
     if not shipping_method:
-        msg = pgettext(
-            'Voucher not applicable',
-            'Please select a shipping method first.')
+        msg = "Please select a shipping method first."
         raise NotApplicable(msg)
 
     # check if voucher is limited to specified countries
-    shipping_country = cart.shipping_address.country
-    if voucher.countries and shipping_country.code not in voucher.countries:
-        msg = pgettext(
-            'Voucher not applicable',
-            'This offer is not valid in your country.')
-        raise NotApplicable(msg)
+    if address:
+        if voucher.countries and address.country.code not in voucher.countries:
+            msg = "This offer is not valid in your country."
+            raise NotApplicable(msg)
 
-    return get_shipping_voucher_discount(
-        voucher, cart.get_subtotal(), shipping_method.get_total())
+    shipping_price = calculations.checkout_shipping_price(
+        manager=manager,
+        checkout=checkout,
+        lines=lines,
+        address=address,
+        discounts=discounts,
+    ).gross
+    return voucher.get_discount_amount_for(shipping_price, checkout.channel)
 
 
-def _get_products_voucher_discount(order_or_cart, voucher):
-    """Calculate products discount value for a voucher, depending on its type.
-    """
-    if voucher.type == VoucherType.PRODUCT:
-        prices = get_prices_of_discounted_products(
-            order_or_cart.lines.all(), voucher.products.all())
-    elif voucher.type == VoucherType.COLLECTION:
-        prices = get_prices_of_products_in_discounted_collections(
-            order_or_cart.lines.all(), voucher.collections.all())
-    elif voucher.type == VoucherType.CATEGORY:
-        prices = get_prices_of_products_in_discounted_categories(
-            order_or_cart.lines.all(), voucher.categories.all())
+def _get_products_voucher_discount(
+    manager: PluginsManager,
+    checkout: "Checkout",
+    lines: Iterable["CheckoutLineInfo"],
+    voucher,
+    channel: "Channel",
+    discounts: Optional[Iterable[DiscountInfo]] = None,
+):
+    """Calculate products discount value for a voucher, depending on its type."""
+    prices = None
+    if voucher.type == VoucherType.SPECIFIC_PRODUCT:
+        prices = get_prices_of_discounted_specific_product(
+            manager, checkout, lines, voucher, channel, discounts
+        )
     if not prices:
-        msg = pgettext(
-            'Voucher not applicable',
-            'This offer is only valid for selected items.')
+        msg = "This offer is only valid for selected items."
         raise NotApplicable(msg)
-    return get_products_voucher_discount(voucher, prices)
+    return get_products_voucher_discount(voucher, prices, channel)
 
 
-def get_voucher_discount_for_cart(voucher, cart):
+def get_discounted_lines(lines: Iterable["CheckoutLineInfo"], voucher):
+    discounted_products = voucher.products.all()
+    discounted_categories = set(voucher.categories.all())
+    discounted_collections = set(voucher.collections.all())
+
+    discounted_lines = []
+    if discounted_products or discounted_collections or discounted_categories:
+        for line_info in lines:
+            line_product = line_info.product
+            line_category = line_info.product.category
+            line_collections = set(line_info.collections)
+            if line_info.variant and (
+                line_product in discounted_products
+                or line_category in discounted_categories
+                or line_collections.intersection(discounted_collections)
+            ):
+                discounted_lines.append(line_info.line)
+    else:
+        # If there's no discounted products, collections or categories,
+        # it means that all products are discounted
+        discounted_lines.extend([line_info.line for line_info in lines])
+    return discounted_lines
+
+
+def get_prices_of_discounted_specific_product(
+    manager: PluginsManager,
+    checkout: "Checkout",
+    lines: Iterable["CheckoutLineInfo"],
+    voucher: Voucher,
+    channel: Channel,
+    discounts: Optional[Iterable[DiscountInfo]] = None,
+) -> List[Money]:
+    """Get prices of variants belonging to the discounted specific products.
+
+    Specific products are products, collections and categories.
+    Product must be assigned directly to the discounted category, assigning
+    product to child category won't work.
+    """
+    line_prices = []
+    discounted_lines = get_discounted_lines(lines, voucher)
+    address = checkout.shipping_address or checkout.billing_address
+
+    for line in discounted_lines:
+        line_total = calculations.checkout_line_total(
+            manager=manager,
+            checkout=checkout,
+            line=line,
+            variant=line.variant,
+            product=line.variant.product,
+            collections=line.variant.product.collections.all(),
+            address=address,
+            channel=channel,
+            channel_listing=line.variant.channel_listings.get(channel=channel),
+            discounts=discounts or [],
+        ).gross
+        line_unit_price = manager.calculate_checkout_line_unit_price(
+            line_total, line.quantity
+        )
+        line_prices.extend([line_unit_price] * line.quantity)
+
+    return line_prices
+
+
+def get_voucher_discount_for_checkout(
+    manager: PluginsManager,
+    voucher: Voucher,
+    checkout: Checkout,
+    lines: Iterable["CheckoutLineInfo"],
+    address: Optional["Address"],
+    discounts: Optional[Iterable[DiscountInfo]] = None,
+) -> Money:
     """Calculate discount value depending on voucher and discount types.
 
     Raise NotApplicable if voucher of given type cannot be applied.
     """
-    if voucher.type == VoucherType.VALUE:
-        return get_value_voucher_discount(voucher, cart.get_subtotal())
+    validate_voucher_for_checkout(manager, voucher, checkout, lines, discounts)
+    if voucher.type == VoucherType.ENTIRE_ORDER:
+        subtotal = calculations.checkout_subtotal(
+            manager=manager,
+            checkout=checkout,
+            lines=lines,
+            address=address,
+            discounts=discounts,
+        ).gross
+        return voucher.get_discount_amount_for(subtotal, checkout.channel)
     if voucher.type == VoucherType.SHIPPING:
-        return _get_shipping_voucher_discount_for_cart(voucher, cart)
-    if voucher.type in (
-            VoucherType.PRODUCT, VoucherType.COLLECTION, VoucherType.CATEGORY):
-        return _get_products_voucher_discount(cart, voucher)
-    raise NotImplementedError('Unknown discount type')
+        return _get_shipping_voucher_discount_for_checkout(
+            manager, voucher, checkout, lines, address, discounts
+        )
+    if voucher.type == VoucherType.SPECIFIC_PRODUCT:
+        return _get_products_voucher_discount(
+            manager, checkout, lines, voucher, checkout.channel, discounts
+        )
+    raise NotImplementedError("Unknown discount type")
 
 
-def get_voucher_for_cart(cart, vouchers=None):
-    """Return voucher with voucher code saved in cart if active or None."""
-    if cart.voucher_code is not None:
+def get_voucher_for_checkout(
+    checkout: Checkout, vouchers=None, with_lock: bool = False
+) -> Optional[Voucher]:
+    """Return voucher with voucher code saved in checkout if active or None."""
+    if checkout.voucher_code is not None:
         if vouchers is None:
-            vouchers = Voucher.objects.active(date=date.today())
+            vouchers = Voucher.objects.active_in_channel(
+                date=timezone.now(), channel_slug=checkout.channel.slug
+            )
         try:
-            return vouchers.get(code=cart.voucher_code)
+            qs = vouchers
+            if with_lock:
+                qs = vouchers.select_for_update()
+            return qs.get(code=checkout.voucher_code)
         except Voucher.DoesNotExist:
             return None
     return None
 
 
-def recalculate_cart_discount(cart, discounts, taxes):
-    """Recalculate `cart.discount` based on the voucher.
+def recalculate_checkout_discount(
+    manager: PluginsManager,
+    checkout: Checkout,
+    lines: Iterable["CheckoutLineInfo"],
+    discounts: Iterable[DiscountInfo],
+):
+    """Recalculate `checkout.discount` based on the voucher.
 
     Will clear both voucher and discount if the discount is no longer
     applicable.
     """
-    voucher = get_voucher_for_cart(cart)
+    voucher = get_voucher_for_checkout(checkout)
     if voucher is not None:
+        address = checkout.shipping_address or checkout.billing_address
         try:
-            discount = get_voucher_discount_for_cart(voucher, cart)
+            discount = get_voucher_discount_for_checkout(
+                manager, voucher, checkout, lines, address, discounts
+            )
         except NotApplicable:
-            remove_voucher_from_cart(cart)
+            remove_voucher_from_checkout(checkout)
         else:
-            subtotal = cart.get_subtotal(discounts, taxes).gross
-            cart.discount_amount = min(discount, subtotal)
-            cart.discount_name = str(voucher)
-            cart.translated_discount_name = (
+            subtotal = calculations.checkout_subtotal(
+                manager=manager,
+                checkout=checkout,
+                lines=lines,
+                address=address,
+                discounts=discounts,
+            ).gross
+            checkout.discount = (
+                min(discount, subtotal)
+                if voucher.type != VoucherType.SHIPPING
+                else discount
+            )
+            checkout.discount_name = voucher.name
+            checkout.translated_discount_name = (
                 voucher.translated.name
-                if voucher.translated.name != voucher.name else '')
-            cart.save(
+                if voucher.translated.name != voucher.name
+                else ""
+            )
+            checkout.save(
                 update_fields=[
-                    'translated_discount_name',
-                    'discount_amount', 'discount_name'])
+                    "translated_discount_name",
+                    "discount_amount",
+                    "discount_name",
+                    "currency",
+                ]
+            )
     else:
-        remove_voucher_from_cart(cart)
+        remove_voucher_from_checkout(checkout)
 
 
-def add_voucher_to_cart(voucher, cart):
-    """Add voucher data to cart.
+def add_promo_code_to_checkout(
+    manager: PluginsManager,
+    checkout: Checkout,
+    lines: Iterable["CheckoutLineInfo"],
+    promo_code: str,
+    discounts: Optional[Iterable[DiscountInfo]] = None,
+):
+    """Add gift card or voucher data to checkout.
 
-    Raise NotApplicable if voucher of given type cannot be applied."""
-    discount_amount = get_voucher_discount_for_cart(voucher, cart)
-    cart.voucher_code = voucher.code
-    cart.discount_name = voucher.name
-    cart.translated_discount_name = (
-        voucher.translated.name
-        if voucher.translated.name != voucher.name else '')
-    cart.discount_amount = discount_amount
-    cart.save(
+    Raise InvalidPromoCode if promo code does not match to any voucher or gift card.
+    """
+    if promo_code_is_voucher(promo_code):
+        add_voucher_code_to_checkout(manager, checkout, lines, promo_code, discounts)
+    elif promo_code_is_gift_card(promo_code):
+        add_gift_card_code_to_checkout(checkout, promo_code)
+    else:
+        raise InvalidPromoCode()
+
+
+def add_voucher_code_to_checkout(
+    manager: PluginsManager,
+    checkout: Checkout,
+    lines: Iterable["CheckoutLineInfo"],
+    voucher_code: str,
+    discounts: Optional[Iterable[DiscountInfo]] = None,
+):
+    """Add voucher data to checkout by code.
+
+    Raise InvalidPromoCode() if voucher of given type cannot be applied.
+    """
+    try:
+        voucher = Voucher.objects.active_in_channel(
+            date=timezone.now(), channel_slug=checkout.channel.slug
+        ).get(code=voucher_code)
+    except Voucher.DoesNotExist:
+        raise InvalidPromoCode()
+    try:
+        add_voucher_to_checkout(manager, checkout, lines, voucher, discounts)
+    except NotApplicable:
+        raise ValidationError(
+            {
+                "promo_code": ValidationError(
+                    "Voucher is not applicable to that checkout.",
+                    code=CheckoutErrorCode.VOUCHER_NOT_APPLICABLE.value,
+                )
+            }
+        )
+
+
+def add_voucher_to_checkout(
+    manager: PluginsManager,
+    checkout: Checkout,
+    lines: Iterable["CheckoutLineInfo"],
+    voucher: Voucher,
+    discounts: Optional[Iterable[DiscountInfo]] = None,
+):
+    """Add voucher data to checkout.
+
+    Raise NotApplicable if voucher of given type cannot be applied.
+    """
+    address = checkout.shipping_address or checkout.billing_address
+    discount = get_voucher_discount_for_checkout(
+        manager, voucher, checkout, lines, address, discounts
+    )
+    checkout.voucher_code = voucher.code
+    checkout.discount_name = voucher.name
+    checkout.translated_discount_name = (
+        voucher.translated.name if voucher.translated.name != voucher.name else ""
+    )
+    checkout.discount = discount
+    checkout.save(
         update_fields=[
-            'voucher_code', 'discount_name', 'translated_discount_name',
-            'discount_amount'])
+            "voucher_code",
+            "discount_name",
+            "translated_discount_name",
+            "discount_amount",
+        ]
+    )
 
 
-def remove_voucher_from_cart(cart):
-    """Remove voucher data from cart."""
-    cart.voucher_code = None
-    cart.discount_name = None
-    cart.translated_discount_name = None
-    cart.discount_amount = ZERO_MONEY
-    cart.save(
+def remove_promo_code_from_checkout(checkout: Checkout, promo_code: str):
+    """Remove gift card or voucher data from checkout."""
+    if promo_code_is_voucher(promo_code):
+        remove_voucher_code_from_checkout(checkout, promo_code)
+    elif promo_code_is_gift_card(promo_code):
+        remove_gift_card_code_from_checkout(checkout, promo_code)
+
+
+def remove_voucher_code_from_checkout(checkout: Checkout, voucher_code: str):
+    """Remove voucher data from checkout by code."""
+    existing_voucher = get_voucher_for_checkout(checkout)
+    if existing_voucher and existing_voucher.code == voucher_code:
+        remove_voucher_from_checkout(checkout)
+
+
+def remove_voucher_from_checkout(checkout: Checkout):
+    """Remove voucher data from checkout."""
+    checkout.voucher_code = None
+    checkout.discount_name = None
+    checkout.translated_discount_name = None
+    checkout.discount_amount = 0
+    checkout.save(
         update_fields=[
-            'voucher_code', 'discount_name', 'translated_discount_name',
-            'discount_amount'])
+            "voucher_code",
+            "discount_name",
+            "translated_discount_name",
+            "discount_amount",
+            "currency",
+        ]
+    )
 
 
-def get_taxes_for_cart(cart, default_taxes):
-    """Return taxes (if handled) due to shipping address or default one."""
-    if not settings.VATLAYER_ACCESS_KEY:
+def get_valid_shipping_methods_for_checkout(
+    checkout: Checkout,
+    lines: Iterable["CheckoutLineInfo"],
+    discounts: Iterable[DiscountInfo],
+    country_code: Optional[str] = None,
+    subtotal: Optional["TaxedMoney"] = None,
+):
+    if not is_shipping_required(lines):
         return None
+    if not checkout.shipping_address:
+        return None
+    # TODO: subtotal should comes from arg instead of calculate it in this function
+    # use info.context.plugins from resolver
+    if subtotal is None:
+        manager = get_plugins_manager()
+        subtotal = manager.calculate_checkout_subtotal(
+            checkout, lines, checkout.shipping_address, discounts
+        )
+    return ShippingMethod.objects.applicable_shipping_methods_for_instance(
+        checkout,
+        channel_id=checkout.channel_id,
+        price=subtotal.gross,
+        country_code=country_code,
+        lines=lines,
+    )
 
-    if cart.shipping_address:
-        return get_taxes_for_country(cart.shipping_address.country)
 
-    return default_taxes
-
-
-def is_valid_shipping_method(cart, taxes, discounts):
+def is_valid_shipping_method(
+    checkout: Checkout,
+    lines: Iterable["CheckoutLineInfo"],
+    discounts: Iterable[DiscountInfo],
+    subtotal: Optional["TaxedMoney"] = None,
+):
     """Check if shipping method is valid and remove (if not)."""
-    if not cart.shipping_method:
+    if not checkout.shipping_method:
+        return False
+    if not checkout.shipping_address:
         return False
 
-    valid_methods = ShippingMethod.objects.applicable_shipping_methods(
-        price=cart.get_subtotal(discounts, taxes).gross,
-        weight=cart.get_total_weight(),
-        country_code=cart.shipping_address.country.code)
-    if cart.shipping_method not in valid_methods:
-        clear_shipping_method(cart)
+    valid_methods = get_valid_shipping_methods_for_checkout(
+        checkout, lines, discounts, subtotal=subtotal
+    )
+    if valid_methods is None or checkout.shipping_method not in valid_methods:
+        clear_shipping_method(checkout)
         return False
     return True
 
 
-def clear_shipping_method(cart):
-    cart.shipping_method = None
-    cart.save(update_fields=['shipping_method'])
+def get_shipping_price_estimate(
+    checkout: Checkout,
+    lines: Iterable["CheckoutLineInfo"],
+    discounts: Iterable[DiscountInfo],
+    country_code: str,
+) -> Optional[TaxedMoneyRange]:
+    """Return the estimated price range for shipping for given order."""
 
+    shipping_methods = get_valid_shipping_methods_for_checkout(
+        checkout, lines, discounts, country_code=country_code
+    )
 
-def _process_voucher_data_for_order(cart):
-    """Fetch, process and return voucher/discount data from cart."""
-    vouchers = Voucher.objects.active(date=date.today()).select_for_update()
-    voucher = get_voucher_for_cart(cart, vouchers)
-
-    if cart.voucher_code and not voucher:
-        msg = pgettext(
-            'Voucher not applicable',
-            'Voucher expired in meantime. Order placement aborted.')
-        raise NotApplicable(msg)
-
-    if not voucher:
-        return {}
-
-    increase_voucher_usage(voucher)
-    return {
-        'voucher': voucher,
-        'discount_amount': cart.discount_amount,
-        'discount_name': cart.discount_name,
-        'translated_discount_name': cart.translated_discount_name}
-
-
-def _process_shipping_data_for_order(cart, taxes):
-    """Fetch, process and return shipping data from cart."""
-    if not cart.is_shipping_required():
-        return {}
-
-    shipping_address = cart.shipping_address
-
-    if cart.user:
-        store_user_address(cart.user, shipping_address, AddressType.SHIPPING)
-        if cart.user.addresses.filter(pk=shipping_address.pk).exists():
-            shipping_address = shipping_address.get_copy()
-
-    return {
-        'shipping_address': shipping_address,
-        'shipping_method': cart.shipping_method,
-        'shipping_method_name': smart_text(cart.shipping_method),
-        'shipping_price': cart.get_shipping_price(taxes),
-        'weight': cart.get_total_weight()}
-
-
-def _process_user_data_for_order(cart):
-    """Fetch, process and return shipping data from cart."""
-    billing_address = cart.billing_address
-
-    if cart.user:
-        store_user_address(cart.user, billing_address, AddressType.BILLING)
-        if cart.user.addresses.filter(pk=billing_address.pk).exists():
-            billing_address = billing_address.get_copy()
-
-    return {
-        'user': cart.user,
-        'user_email': cart.user.email if cart.user else cart.email,
-        'billing_address': billing_address}
-
-
-def _fill_order_with_cart_data(order, cart, discounts, taxes):
-    """Fill an order with data (variants, note) from cart."""
-    from ..order.utils import add_variant_to_order
-
-    for line in cart:
-        add_variant_to_order(
-            order, line.variant, line.quantity, discounts, taxes)
-
-    cart.payments.update(order=order)
-
-    if cart.note:
-        order.customer_note = cart.note
-        order.save(update_fields=['customer_note'])
-
-
-@transaction.atomic
-def create_order(cart, tracking_code, discounts, taxes):
-    """Create an order from the cart.
-
-    Each order will get a private copy of both the billing and the shipping
-    address (if shipping).
-
-    If any of the addresses is new and the user is logged in the address
-    will also get saved to that user's address book.
-
-    Current user's language is saved in the order so we can later determine
-    which language to use when sending email.
-    """
-    order = Order.objects.filter(checkout_token=cart.token).first()
-    if order is not None:
-        return order
-
-    # FIXME: save locale along with the language
-    try:
-        order_data = _process_voucher_data_for_order(cart)
-    except NotApplicable:
+    if shipping_methods is None:
         return None
 
-    order_data.update(_process_shipping_data_for_order(cart, taxes))
-    order_data.update(_process_user_data_for_order(cart))
-    order_data.update({
-        'language_code': get_language(),
-        'tracking_client_id': tracking_code,
-        'total': cart.get_total(discounts, taxes)})
+    # TODO: extension manager should be able to have impact on shipping price estimates
+    min_price_amount, max_price_amount = shipping_methods.aggregate(
+        price_amount_min=Min("price_amount"), price_amount_max=Max("price_amount")
+    ).values()
 
-    order = Order.objects.create(**order_data, checkout_token=cart.token)
-    _fill_order_with_cart_data(order, cart, discounts, taxes)
-    return order
+    if min_price_amount is None:
+        return None
+
+    manager = get_plugins_manager()
+    prices = MoneyRange(
+        start=Money(min_price_amount, checkout.currency),
+        stop=Money(max_price_amount, checkout.currency),
+    )
+    return manager.apply_taxes_to_shipping_price_range(prices, country_code)
 
 
-def is_fully_paid(cart: Cart, taxes, discounts):
-    """Check if checkout is fully paid."""
-    payments = [
-        payment for payment in cart.payments.all() if payment.is_active]
+def clear_shipping_method(checkout: Checkout):
+    checkout.shipping_method = None
+    checkout.save(update_fields=["shipping_method", "last_change"])
+
+
+def is_fully_paid(
+    manager: PluginsManager,
+    checkout: Checkout,
+    lines: Iterable["CheckoutLineInfo"],
+    discounts: Iterable[DiscountInfo],
+):
+    """Check if provided payment methods cover the checkout's total amount.
+
+    Note that these payments may not be captured or charged at all.
+    """
+    payments = [payment for payment in checkout.payments.all() if payment.is_active]
     total_paid = sum([p.total for p in payments])
-    cart_total = cart.get_total(discounts=discounts, taxes=taxes).gross.amount
-    return total_paid >= cart_total
+    address = checkout.shipping_address or checkout.billing_address
+    checkout_total = (
+        calculations.checkout_total(
+            manager=manager,
+            checkout=checkout,
+            lines=lines,
+            address=address,
+            discounts=discounts,
+        )
+        - checkout.get_total_gift_cards_balance()
+    )
+    checkout_total = max(
+        checkout_total, zero_taxed_money(checkout_total.currency)
+    ).gross
+    return total_paid >= checkout_total.amount
 
 
-def ready_to_place_order(cart: Cart, taxes, discounts):
+def clean_checkout(
+    manager: PluginsManager,
+    checkout: Checkout,
+    lines: Iterable["CheckoutLineInfo"],
+    discounts: Iterable[DiscountInfo],
+):
     """Check if checkout can be completed."""
-    if cart.is_shipping_required():
-        if not cart.shipping_method:
-            return False, pgettext_lazy(
-                'order placement_error', 'Shipping method is not set')
-        if not cart.shipping_address:
-            return False, pgettext_lazy(
-                'order placement error', 'Shipping address is not set')
-        if not is_valid_shipping_method(cart, taxes, discounts):
-            return False, pgettext_lazy(
-                'order placement error',
-                'Shipping method is not valid for your shipping address')
-    if not is_fully_paid(cart, taxes, discounts):
-        return False, pgettext_lazy(
-            'order placement error', 'Checkout is not fully paid')
-    return True, None
+    if is_shipping_required(lines):
+        if not checkout.shipping_method:
+            raise ValidationError(
+                "Shipping method is not set",
+                code=CheckoutErrorCode.SHIPPING_METHOD_NOT_SET.value,
+            )
+        if not checkout.shipping_address:
+            raise ValidationError(
+                "Shipping address is not set",
+                code=CheckoutErrorCode.SHIPPING_ADDRESS_NOT_SET.value,
+            )
+        if not is_valid_shipping_method(checkout, lines, discounts):
+            raise ValidationError(
+                "Shipping method is not valid for your shipping address",
+                code=CheckoutErrorCode.INVALID_SHIPPING_METHOD.value,
+            )
+
+    if not checkout.billing_address:
+        raise ValidationError(
+            "Billing address is not set",
+            code=CheckoutErrorCode.BILLING_ADDRESS_NOT_SET.value,
+        )
+
+    if not is_fully_paid(manager, checkout, lines, discounts):
+        raise ValidationError(
+            "Provided payment methods can not cover the checkout's total amount",
+            code=CheckoutErrorCode.CHECKOUT_NOT_FULLY_PAID.value,
+        )
+
+
+def cancel_active_payments(checkout: Checkout):
+    checkout.payments.filter(is_active=True).update(is_active=False)
+
+
+def fetch_checkout_lines(checkout: Checkout) -> Iterable[CheckoutLineInfo]:
+    """Fetch checkout lines as CheckoutLineInfo objects."""
+    lines = checkout.lines.prefetch_related(
+        "variant__product__collections",
+        "variant__channel_listings__channel",
+        "variant__product__product_type",
+    )
+    lines_info = []
+
+    for line in lines:
+        variant = line.variant
+        product = variant.product
+        collections = list(product.collections.all())
+
+        variant_channel_listing = None
+        for channel_listing in line.variant.channel_listings.all():
+            if channel_listing.channel_id == checkout.channel_id:
+                variant_channel_listing = channel_listing
+
+        # FIXME: Temporary solution to pass type checks. Figure out how to handle case
+        # when variant channel listing is not defined for a checkout line.
+        if not variant_channel_listing:
+            continue
+
+        lines_info.append(
+            CheckoutLineInfo(
+                line=line,
+                variant=variant,
+                channel_listing=variant_channel_listing,
+                product=product,
+                collections=collections,
+            )
+        )
+    return lines_info
+
+
+def is_shipping_required(lines: Iterable[CheckoutLineInfo]):
+    """Check if shipping is required for given checkout lines."""
+    return any(
+        line_info.product.product_type.is_shipping_required for line_info in lines
+    )

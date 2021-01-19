@@ -1,346 +1,443 @@
+from collections import defaultdict
+from typing import List
+
 import graphene
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ObjectDoesNotExist, ValidationError
+from django.db import transaction
 from django.db.models import Q
-from django.template.defaultfilters import slugify
-from graphql_jwt.decorators import permission_required
 
+from ....attribute import AttributeType
+from ....attribute import models as attribute_models
+from ....core.permissions import ProductPermissions, ProductTypePermissions
 from ....product import models
-from ...core.mutations import ModelDeleteMutation, ModelMutation
-from ...product.types import ProductType
-from ..descriptions import AttributeDescriptions, AttributeValueDescriptions
-from ..enums import AttributeTypeEnum
-from ..types import Attribute
+from ....product.error_codes import ProductErrorCode
+from ...attribute.mutations import (
+    BaseReorderAttributesMutation,
+    BaseReorderAttributeValuesMutation,
+)
+from ...attribute.types import Attribute
+from ...channel import ChannelContext
+from ...core.inputs import ReorderInput
+from ...core.mutations import BaseMutation
+from ...core.types.common import ProductError
+from ...core.utils import from_global_id_strict_type
+from ...core.utils.reordering import perform_reordering
+from ...product.types import Product, ProductType, ProductVariant
+from ..enums import ProductAttributeType
 
 
-class AttributeValueCreateInput(graphene.InputObjectType):
-    name = graphene.String(
-        required=True, description=AttributeValueDescriptions.NAME)
-    value = graphene.String(description=AttributeValueDescriptions.VALUE)
+class ProductAttributeAssignInput(graphene.InputObjectType):
+    id = graphene.ID(required=True, description="The ID of the attribute to assign.")
+    type = ProductAttributeType(
+        required=True, description="The attribute type to be assigned as."
+    )
 
 
-class AttributeCreateInput(graphene.InputObjectType):
-    name = graphene.String(
-        required=True, description=AttributeDescriptions.NAME)
-    values = graphene.List(
-        AttributeValueCreateInput, description=AttributeDescriptions.VALUES)
-
-
-class AttributeUpdateInput(graphene.InputObjectType):
-    name = graphene.String(description=AttributeDescriptions.NAME)
-    remove_values = graphene.List(
-        graphene.ID, name='removeValues',
-        description='IDs of values to be removed from this attribute.')
-    add_values = graphene.List(
-        AttributeValueCreateInput, name='addValues',
-        description='New values to be created for this attribute.')
-
-
-class AttributeMixin:
-    @classmethod
-    def check_unique_values(cls, values_input, attribute, errors):
-        # Check values uniqueness in case of creating new attribute.
-        existing_values = attribute.values.values_list('slug', flat=True)
-        for value_data in values_input:
-            slug = slugify(value_data['name'])
-            if slug in existing_values:
-                msg = (
-                    'Value %s already exists within this attribute.' %
-                    value_data['name'])
-                cls.add_error(errors, cls.ATTRIBUTE_VALUES_FIELD, msg)
-
-        new_slugs = [
-            slugify(value_data['name']) for value_data in values_input]
-        if len(set(new_slugs)) != len(new_slugs):
-            cls.add_error(
-                errors, cls.ATTRIBUTE_VALUES_FIELD,
-                'Provided values are not unique.')
-
-    @classmethod
-    def clean_values(cls, cleaned_input, attribute, errors):
-        """Clean attribute values.
-
-        Transforms AttributeValueCreateInput into AttributeValue instances.
-        Slugs are created from given names and checked for uniqueness within
-        an attribute.
-        """
-        values_input = cleaned_input[cls.ATTRIBUTE_VALUES_FIELD]
-        for value_data in values_input:
-            value_data['slug'] = slugify(value_data['name'])
-            attribute_value = models.AttributeValue(
-                **value_data, attribute=attribute)
-            try:
-                attribute_value.full_clean()
-            except ValidationError as validation_errors:
-                for field in validation_errors.message_dict:
-                    if field == 'attribute':
-                        continue
-                    for message in validation_errors.message_dict[field]:
-                        cls.add_error(
-                            errors, cls.ATTRIBUTE_VALUES_FIELD, message)
-        cls.check_unique_values(values_input, attribute, errors)
-        return errors
-
-    @classmethod
-    def clean_attribute(
-            cls, instance, cleaned_input, errors, product_type=None):
-        if 'name' in cleaned_input:
-            slug = slugify(cleaned_input['name'])
-        elif instance.pk:
-            slug = instance.slug
-        else:
-            cls.add_error(errors, 'name', 'This field cannot be blank.')
-            return cleaned_input
-        cleaned_input['slug'] = slug
-
-        if not product_type:
-            product_type = instance.product_type
-
-        query = models.Attribute.objects.filter(slug=slug).filter(
-            Q(product_type=product_type)
-            | Q(product_variant_type=product_type))
-        query = query.exclude(pk=getattr(instance, 'pk', None))
-        if query.exists():
-            cls.add_error(
-                errors, 'name',
-                'Attribute already exists within this product type.')
-        return cleaned_input
-
-    @classmethod
-    def _save_m2m(cls, info, attribute, cleaned_data):
-        super()._save_m2m(info, attribute, cleaned_data)
-        values = cleaned_data.get(cls.ATTRIBUTE_VALUES_FIELD) or []
-        for value in values:
-            attribute.values.create(**value)
-
-
-class AttributeCreate(AttributeMixin, ModelMutation):
-    ATTRIBUTE_VALUES_FIELD = 'values'
-
-    attribute = graphene.Field(Attribute, description='A created Attribute.')
-    product_type = graphene.Field(
-        ProductType,
-        description='A product type to which an attribute was added.')
+class ProductAttributeAssign(BaseMutation):
+    product_type = graphene.Field(ProductType, description="The updated product type.")
 
     class Arguments:
-        id = graphene.ID(
+        product_type_id = graphene.ID(
             required=True,
-            description='ID of the ProductType to create an attribute for.')
-        type = AttributeTypeEnum(
+            description="ID of the product type to assign the attributes into.",
+        )
+        operations = graphene.List(
+            ProductAttributeAssignInput,
+            required=True,
+            description="The operations to perform.",
+        )
+
+    class Meta:
+        description = "Assign attributes to a given product type."
+        error_type_class = ProductError
+        error_type_field = "product_errors"
+
+    @classmethod
+    def check_permissions(cls, context):
+        return context.user.has_perm(
+            ProductTypePermissions.MANAGE_PRODUCT_TYPES_AND_ATTRIBUTES
+        )
+
+    @classmethod
+    def get_operations(cls, info, operations: List[ProductAttributeAssignInput]):
+        """Resolve all passed global ids into integer PKs of the Attribute type."""
+        product_attrs_pks = []
+        variant_attrs_pks = []
+
+        for operation in operations:
+            pk = from_global_id_strict_type(
+                operation.id, only_type=Attribute, field="operations"
+            )
+            if operation.type == ProductAttributeType.PRODUCT:
+                product_attrs_pks.append(pk)
+            else:
+                variant_attrs_pks.append(pk)
+
+        return product_attrs_pks, variant_attrs_pks
+
+    @classmethod
+    def check_attributes_types(cls, errors, product_attrs_pks, variant_attrs_pks):
+        """Ensure the attributes are product attributes."""
+
+        not_valid_attributes = attribute_models.Attribute.objects.filter(
+            Q(pk__in=product_attrs_pks) | Q(pk__in=variant_attrs_pks)
+        ).exclude(type=AttributeType.PRODUCT_TYPE)
+
+        if not_valid_attributes:
+            not_valid_attr_ids = [
+                graphene.Node.to_global_id("Attribute", attr.pk)
+                for attr in not_valid_attributes
+            ]
+            error = ValidationError(
+                "Only product attributes can be assigned.",
+                code=ProductErrorCode.INVALID.value,
+                params={"attributes": not_valid_attr_ids},
+            )
+            errors["operations"].append(error)
+
+    @classmethod
+    def check_operations_not_assigned_already(
+        cls, errors, product_type, product_attrs_pks, variant_attrs_pks
+    ):
+        qs = (
+            attribute_models.Attribute.objects.get_assigned_product_type_attributes(
+                product_type.pk
+            )
+            .values_list("pk", "name", "slug")
+            .filter(Q(pk__in=product_attrs_pks) | Q(pk__in=variant_attrs_pks))
+        )
+
+        invalid_attributes = list(qs)
+        if invalid_attributes:
+            msg = ", ".join(
+                [f"{name} ({slug})" for _, name, slug in invalid_attributes]
+            )
+            invalid_attr_ids = [
+                graphene.Node.to_global_id("Attribute", attr[0])
+                for attr in invalid_attributes
+            ]
+            error = ValidationError(
+                (f"{msg} have already been assigned to this product type."),
+                code=ProductErrorCode.ATTRIBUTE_ALREADY_ASSIGNED,
+                params={"attributes": invalid_attr_ids},
+            )
+            errors["operations"].append(error)
+
+    @classmethod
+    def check_product_operations_are_assignable(cls, errors, product_attrs_pks):
+        restricted_attributes = attribute_models.Attribute.objects.filter(
+            pk__in=product_attrs_pks, is_variant_only=True
+        )
+
+        if restricted_attributes:
+            restricted_attr_ids = [
+                graphene.Node.to_global_id("Attribute", attr.pk)
+                for attr in restricted_attributes
+            ]
+            error = ValidationError(
+                "Cannot assign variant only attributes.",
+                code=ProductErrorCode.ATTRIBUTE_CANNOT_BE_ASSIGNED,
+                params={"attributes": restricted_attr_ids},
+            )
+            errors["operations"].append(error)
+
+    @classmethod
+    def clean_operations(cls, product_type, product_attrs_pks, variant_attrs_pks):
+        """Ensure the attributes are not already assigned to the product type."""
+        errors = defaultdict(list)
+
+        attrs_pk = product_attrs_pks + variant_attrs_pks
+        attributes = attribute_models.Attribute.objects.filter(
+            id__in=attrs_pk
+        ).values_list("pk", flat=True)
+        if len(attrs_pk) != len(attributes):
+            invalid_attrs = set(attrs_pk) - set(attributes)
+            invalid_attrs = [
+                graphene.Node.to_global_id("Attribute", pk) for pk in invalid_attrs
+            ]
+            error = ValidationError(
+                "Attribute doesn't exist.",
+                code=ProductErrorCode.NOT_FOUND,
+                params={"attributes": list(invalid_attrs)},
+            )
+            errors["operations"].append(error)
+
+        cls.check_attributes_types(errors, product_attrs_pks, variant_attrs_pks)
+        cls.check_product_operations_are_assignable(errors, product_attrs_pks)
+        cls.check_operations_not_assigned_already(
+            errors, product_type, product_attrs_pks, variant_attrs_pks
+        )
+
+        if errors:
+            raise ValidationError(errors)
+
+    @classmethod
+    def save_field_values(cls, product_type, model_name, pks):
+        """Add in bulk the PKs to assign to a given product type."""
+        model = getattr(attribute_models, model_name)
+        for pk in pks:
+            model.objects.create(product_type=product_type, attribute_id=pk)
+
+    @classmethod
+    @transaction.atomic()
+    def perform_mutation(cls, _root, info, **data):
+        product_type_id: str = data["product_type_id"]
+        operations: List[ProductAttributeAssignInput] = data["operations"]
+        # Retrieve the requested product type
+        product_type: models.ProductType = graphene.Node.get_node_from_global_id(
+            info, product_type_id, only_type=ProductType
+        )
+
+        # Resolve all the passed IDs to ints
+        product_attrs_pks, variant_attrs_pks = cls.get_operations(info, operations)
+
+        if variant_attrs_pks and not product_type.has_variants:
+            raise ValidationError(
+                {
+                    "operations": ValidationError(
+                        "Variants are disabled in this product type.",
+                        code=ProductErrorCode.ATTRIBUTE_VARIANTS_DISABLED.value,
+                    )
+                }
+            )
+
+        # Ensure the attribute are assignable
+        cls.clean_operations(product_type, product_attrs_pks, variant_attrs_pks)
+
+        # Commit
+        cls.save_field_values(product_type, "AttributeProduct", product_attrs_pks)
+        cls.save_field_values(product_type, "AttributeVariant", variant_attrs_pks)
+
+        return cls(product_type=product_type)
+
+
+class ProductAttributeUnassign(BaseMutation):
+    product_type = graphene.Field(ProductType, description="The updated product type.")
+
+    class Arguments:
+        product_type_id = graphene.ID(
             required=True,
             description=(
-                'Type of an Attribute, if should be created for Products '
-                'or Variants of this ProductType.'))
-        input = AttributeCreateInput(
+                "ID of the product type from which the attributes should be unassigned."
+            ),
+        )
+        attribute_ids = graphene.List(
+            graphene.ID,
             required=True,
-            description='Fields required to create an attribute.')
+            description="The IDs of the attributes to unassign.",
+        )
 
     class Meta:
-        description = 'Creates an attribute.'
-        model = models.Attribute
+        description = "Un-assign attributes from a given product type."
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     @classmethod
-    @permission_required('product.manage_products')
-    def mutate(cls, root, info, id, type, input):
-        errors = []
-        product_type = cls.get_node_or_error(
-            info, id, errors, 'id', ProductType)
-        if not product_type:
-            return AttributeCreate(errors=errors)
-        instance = models.Attribute()
+    def check_permissions(cls, context):
+        return context.user.has_perm(
+            ProductTypePermissions.MANAGE_PRODUCT_TYPES_AND_ATTRIBUTES
+        )
 
-        cleaned_input = cls.clean_input(info, instance, input, errors)
-        cls.clean_attribute(
-            instance, cleaned_input, errors, product_type=product_type)
-        cls.clean_values(cleaned_input, instance, errors)
+    @classmethod
+    def save_field_values(cls, product_type, field, pks):
+        """Add in bulk the PKs to assign to a given product type."""
+        getattr(product_type, field).remove(*pks)
 
-        instance = cls.construct_instance(instance, cleaned_input)
-        cls.clean_instance(instance, errors)
-        if errors:
-            return AttributeCreate(errors=errors)
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        product_type_id: str = data["product_type_id"]
+        attribute_ids: List[str] = data["attribute_ids"]
+        # Retrieve the requested product type
+        product_type = graphene.Node.get_node_from_global_id(
+            info, product_type_id, only_type=ProductType
+        )  # type: models.ProductType
 
-        instance.save()
-        if type == AttributeTypeEnum.VARIANT.name:
-            product_type.variant_attributes.add(instance)
+        # Resolve all the passed IDs to ints
+        attribute_pks = [
+            from_global_id_strict_type(
+                attribute_id, only_type=Attribute, field="attribute_id"
+            )
+            for attribute_id in attribute_ids
+        ]
+
+        # Commit
+        cls.save_field_values(product_type, "product_attributes", attribute_pks)
+        cls.save_field_values(product_type, "variant_attributes", attribute_pks)
+
+        return cls(product_type=product_type)
+
+
+class ProductTypeReorderAttributes(BaseReorderAttributesMutation):
+    product_type = graphene.Field(
+        ProductType, description="Product type from which attributes are reordered."
+    )
+
+    class Meta:
+        description = "Reorder the attributes of a product type."
+        permissions = (ProductTypePermissions.MANAGE_PRODUCT_TYPES_AND_ATTRIBUTES,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
+
+    class Arguments:
+        product_type_id = graphene.Argument(
+            graphene.ID, required=True, description="ID of a product type."
+        )
+        type = ProductAttributeType(
+            required=True, description="The attribute type to reorder."
+        )
+        moves = graphene.List(
+            ReorderInput,
+            required=True,
+            description="The list of attribute reordering operations.",
+        )
+
+    @classmethod
+    def perform_mutation(cls, _root, info, product_type_id, type, moves):
+        pk = from_global_id_strict_type(
+            product_type_id, only_type=ProductType, field="product_type_id"
+        )
+
+        if type == ProductAttributeType.PRODUCT:
+            m2m_field = "attributeproduct"
         else:
-            product_type.product_attributes.add(instance)
-        cls._save_m2m(info, instance, cleaned_input)
-        return AttributeCreate(
-            attribute=instance, product_type=product_type, errors=errors)
+            m2m_field = "attributevariant"
+
+        try:
+            product_type = models.ProductType.objects.prefetch_related(m2m_field).get(
+                pk=pk
+            )
+        except ObjectDoesNotExist:
+            raise ValidationError(
+                {
+                    "product_type_id": ValidationError(
+                        (f"Couldn't resolve to a product type: {product_type_id}"),
+                        code=ProductErrorCode.NOT_FOUND,
+                    )
+                }
+            )
+
+        attributes_m2m = getattr(product_type, m2m_field)
+
+        try:
+            operations = cls.prepare_operations(moves, attributes_m2m)
+        except ValidationError as error:
+            error.code = ProductErrorCode.NOT_FOUND.value
+            raise ValidationError({"moves": error})
+
+        with transaction.atomic():
+            perform_reordering(attributes_m2m, operations)
+
+        return ProductTypeReorderAttributes(product_type=product_type)
 
 
-class AttributeUpdate(AttributeMixin, ModelMutation):
-    ATTRIBUTE_VALUES_FIELD = 'add_values'
+class ProductReorderAttributeValues(BaseReorderAttributeValuesMutation):
+    product = graphene.Field(
+        Product, description="Product from which attribute values are reordered."
+    )
 
-    product_type = graphene.Field(
-        ProductType, description='A related product type.')
+    class Meta:
+        description = "Reorder product attribute values."
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     class Arguments:
-        id = graphene.ID(
-            required=True, description='ID of an attribute to update.')
-        input = AttributeUpdateInput(
+        product_id = graphene.Argument(
+            graphene.ID, required=True, description="ID of a product."
+        )
+        attribute_id = graphene.Argument(
+            graphene.ID, required=True, description="ID of an attribute."
+        )
+        moves = graphene.List(
+            ReorderInput,
             required=True,
-            description='Fields required to update an attribute.')
+            description="The list of reordering operations for given attribute values.",
+        )
+
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        product_id = data["product_id"]
+        product = cls.perform(
+            product_id, "product", data, "productvalueassignment", ProductErrorCode
+        )
+
+        return ProductReorderAttributeValues(
+            product=ChannelContext(node=product, channel_slug=None)
+        )
+
+    @staticmethod
+    def get_instance(instance_id: str):
+        pk = from_global_id_strict_type(
+            instance_id, only_type=Product, field="product_id"
+        )
+
+        try:
+            product = models.Product.objects.prefetch_related("attributes").get(pk=pk)
+        except ObjectDoesNotExist:
+            raise ValidationError(
+                {
+                    "product_id": ValidationError(
+                        (f"Couldn't resolve to a product: {instance_id}"),
+                        code=ProductErrorCode.NOT_FOUND.value,
+                    )
+                }
+            )
+        return product
+
+
+class ProductVariantReorderAttributeValues(BaseReorderAttributeValuesMutation):
+    product_variant = graphene.Field(
+        ProductVariant,
+        description="Product variant from which attribute values are reordered.",
+    )
 
     class Meta:
-        description = 'Updates attribute.'
-        model = models.Attribute
-
-    @classmethod
-    def clean_remove_values(cls, cleaned_input, instance, errors):
-        """Check if AttributeValues to be removed are assigned to given
-        Attribute.
-        """
-        remove_values = cleaned_input.get('remove_values', [])
-        for value in remove_values:
-            if value.attribute != instance:
-                msg = 'Value %s does not belong to this attribute.' % value
-                cls.add_error(errors, 'remove_values', msg)
-        return remove_values
-
-    @classmethod
-    def _save_m2m(cls, info, instance, cleaned_data):
-        super()._save_m2m(info, instance, cleaned_data)
-        for attribute_value in cleaned_data.get('remove_values', []):
-            attribute_value.delete()
-
-    @classmethod
-    @permission_required('product.manage_products')
-    def mutate(cls, root, info, id, input):
-        errors = []
-        instance = cls.get_node_or_error(info, id, errors, 'id', Attribute)
-
-        cleaned_input = cls.clean_input(info, instance, input, errors)
-        product_type = instance.product_type
-        cls.clean_attribute(
-            instance, cleaned_input, errors, product_type=product_type)
-        cls.clean_values(cleaned_input, instance, errors)
-        cls.clean_remove_values(cleaned_input, instance, errors)
-
-        instance = cls.construct_instance(instance, cleaned_input)
-        cls.clean_instance(instance, errors)
-        if errors:
-            return AttributeUpdate(errors=errors)
-
-        instance.save()
-        cls._save_m2m(info, instance, cleaned_input)
-        return AttributeUpdate(
-            attribute=instance, product_type=product_type, errors=errors)
-
-
-class AttributeDelete(ModelDeleteMutation):
-    product_type = graphene.Field(
-        ProductType, description='A related product type.')
+        description = "Reorder product variant attribute values."
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     class Arguments:
-        id = graphene.ID(
-            required=True, description='ID of an attribute to delete.')
-
-    class Meta:
-        description = 'Deletes an attribute.'
-        model = models.Attribute
-
-    @classmethod
-    def user_is_allowed(cls, user, input):
-        return user.has_perm('product.manage_products')
-
-    @classmethod
-    def success_response(cls, instance):
-        response = super().success_response(instance)
-        response.product_type = (
-            instance.product_type or instance.product_variant_type)
-        return response
-
-
-class AttributeValueCreate(ModelMutation):
-    attribute = graphene.Field(Attribute, description='A related Attribute.')
-
-    class Arguments:
-        attribute_id = graphene.ID(
-            required=True, name='attribute',
-            description='Attribute to which value will be assigned.')
-        input = AttributeValueCreateInput(
+        variant_id = graphene.Argument(
+            graphene.ID, required=True, description="ID of a product variant."
+        )
+        attribute_id = graphene.Argument(
+            graphene.ID, required=True, description="ID of an attribute."
+        )
+        moves = graphene.List(
+            ReorderInput,
             required=True,
-            description='Fields required to create an AttributeValue.')
-
-    class Meta:
-        description = 'Creates a value for an attribute.'
-        model = models.AttributeValue
+            description="The list of reordering operations for given attribute values.",
+        )
 
     @classmethod
-    def clean_input(cls, info, instance, input, errors):
-        cleaned_input = super().clean_input(info, instance, input, errors)
-        cleaned_input['slug'] = slugify(cleaned_input['name'])
-        return cleaned_input
+    def perform_mutation(cls, _root, info, **data):
+        variant_id = data["variant_id"]
+        variant = cls.perform(
+            variant_id, "variant", data, "variantvalueassignment", ProductErrorCode
+        )
 
-    @classmethod
-    @permission_required('product.manage_products')
-    def mutate(cls, root, info, attribute_id, input):
-        errors = []
-        attribute = cls.get_node_or_error(
-            info, attribute_id, errors, 'id', Attribute)
+        return ProductVariantReorderAttributeValues(
+            product_variant=ChannelContext(node=variant, channel_slug=None)
+        )
 
-        instance = models.AttributeValue(attribute=attribute)
-        cleaned_input = cls.clean_input(info, instance, input, errors)
-        instance = cls.construct_instance(instance, cleaned_input)
-        cls.clean_instance(instance, errors)
-        if errors:
-            return cls(errors=errors)
+    @staticmethod
+    def get_instance(instance_id: str):
+        pk = from_global_id_strict_type(
+            instance_id, only_type=ProductVariant, field="variant_id"
+        )
 
-        instance.save()
-        cls._save_m2m(info, instance, cleaned_input)
-        return AttributeValueCreate(
-            attribute=attribute, attributeValue=instance, errors=errors)
-
-
-class AttributeValueUpdate(ModelMutation):
-    attribute = graphene.Field(Attribute, description='A related Attribute.')
-
-    class Arguments:
-        id = graphene.ID(
-            required=True,
-            description='ID of an AttributeValue to update.')
-        input = AttributeValueCreateInput(
-            required=True,
-            description='Fields required to update an AttributeValue.')
-
-    class Meta:
-        description = 'Updates value of an attribute.'
-        model = models.AttributeValue
-
-    @classmethod
-    def user_is_allowed(cls, user, input):
-        return user.has_perm('product.manage_products')
-
-    @classmethod
-    def clean_input(cls, info, instance, input, errors):
-        cleaned_input = super().clean_input(info, instance, input, errors)
-        if 'name' in cleaned_input:
-            cleaned_input['slug'] = slugify(cleaned_input['name'])
-        return cleaned_input
-
-    @classmethod
-    def success_response(cls, instance):
-        response = super().success_response(instance)
-        response.attribute = instance.attribute
-        return response
-
-
-class AttributeValueDelete(ModelDeleteMutation):
-    attribute = graphene.Field(Attribute, description='A related Attribute.')
-
-    class Arguments:
-        id = graphene.ID(required=True, description='ID of a value to delete.')
-
-    class Meta:
-        description = 'Deletes a value of an attribute.'
-        model = models.AttributeValue
-
-    @classmethod
-    def user_is_allowed(cls, user, input):
-        return user.has_perm('product.manage_products')
-
-    @classmethod
-    def success_response(cls, instance):
-        response = super().success_response(instance)
-        response.attribute = instance.attribute
-        return response
+        try:
+            variant = models.ProductVariant.objects.prefetch_related("attributes").get(
+                pk=pk
+            )
+        except ObjectDoesNotExist:
+            raise ValidationError(
+                {
+                    "variant_id": ValidationError(
+                        (f"Couldn't resolve to a product variant: {instance_id}"),
+                        code=ProductErrorCode.NOT_FOUND.value,
+                    )
+                }
+            )
+        return variant

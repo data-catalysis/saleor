@@ -1,20 +1,33 @@
 import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List
 
-from django.utils.translation import pgettext_lazy
+if TYPE_CHECKING:
+    from ..product.models import (
+        Collection,
+        Product,
+        ProductVariant,
+        ProductVariantChannelListing,
+    )
+    from .models import CheckoutLine
 
 logger = logging.getLogger(__name__)
 
 
 class AddressType:
-    BILLING = 'billing'
-    SHIPPING = 'shipping'
+    BILLING = "billing"
+    SHIPPING = "shipping"
 
     CHOICES = [
-        (BILLING, pgettext_lazy(
-            'Type of address used to fulfill order',
-            'Billing'
-        )),
-        (SHIPPING, pgettext_lazy(
-            'Type of address used to fulfill order',
-            'Shipping'
-        ))]
+        (BILLING, "Billing"),
+        (SHIPPING, "Shipping"),
+    ]
+
+
+@dataclass
+class CheckoutLineInfo:
+    line: "CheckoutLine"
+    variant: "ProductVariant"
+    channel_listing: "ProductVariantChannelListing"
+    product: "Product"
+    collections: List["Collection"]
